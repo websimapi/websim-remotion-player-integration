@@ -55,27 +55,42 @@ function BingoCage({ size = 300, ballCount = 14 }) {
   const [balls, setBalls] = useState(() => {
     const arr = [];
     for (let i = 0; i < ballCount; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const radius = (Math.random() * 0.35 + 0.05) * 0.45;
+      const x = 0.5 + Math.cos(angle) * radius;
+      const y = 0.5 + Math.sin(angle) * radius;
       arr.push({
         id: i + 1,
-        x: 0.5 + (Math.random() - 0.5) * 0.3,
-        y: 0.5 + (Math.random() - 0.5) * 0.25,
-        vx: (Math.random() - 0.5) * 2e-3,
-        vy: (Math.random() - 0.5) * 2e-3,
-        color: ["#ff6b6b", "#ffd54f", "#6bcBFF", "#8de48d", "#f6a6ff"][i % 5]
+        x,
+        y,
+        vx: (Math.random() - 0.5) * 25e-4,
+        vy: (Math.random() - 0.5) * 25e-4,
+        color: ["#ff6b6b", "#ffd54f", "#6bcBFF", "#8de48d", "#f6a6ff"][i % 5],
+        radius: 0.06,
+        // relative radius
+        alive: true,
+        // true = inside cage
+        dropping: false,
+        // dropping through chute
+        dropY: 0
+        // visual drop progress
       });
     }
     return arr;
   });
-  const [spinning, setSpinning] = useState(false);
   const rafRef = useRef(null);
+  const lastTsRef = useRef(performance.now());
+  const spinningRef = useRef(false);
+  const spinVelRef = useRef(0);
   const spinStartRef = useRef(0);
-  const rotationRef = useRef(0);
+  const [spinning, setSpinning] = useState(false);
+  const [queuedDrop, setQueuedDrop] = useState(null);
   useEffect(() => {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
   }, []);
-  const clampInside = (x, y, r2 = 0.49) => {
+  const clampInsidePoint = (x, y, r2 = 0.49) => {
     const cx2 = x - 0.5, cy2 = y - 0.5;
     const dist = Math.sqrt(cx2 * cx2 + cy2 * cy2);
     if (dist > r2) {
@@ -84,40 +99,114 @@ function BingoCage({ size = 300, ballCount = 14 }) {
     }
     return [x, y];
   };
-  const step = (ts) => {
-    if (!spinStartRef.current) spinStartRef.current = ts;
-    const elapsed = ts - spinStartRef.current;
-    const duration = 1400;
-    const t = Math.min(1, elapsed / duration);
-    const speed = (1 - Math.pow(t, 2)) * 0.015;
-    rotationRef.current += speed * 16;
+  const stepPhysics = (ts) => {
+    const dt = Math.min(32, ts - lastTsRef.current);
+    lastTsRef.current = ts;
+    if (spinningRef.current) {
+      const elapsed = ts - spinStartRef.current;
+      const duration = 1400;
+      const t = Math.min(1, elapsed / duration);
+      spinVelRef.current = (1 - t) * 0.018 + 2e-3 * Math.random();
+      if (t >= 1 && queuedDrop === null) {
+        setQueuedDrop(true);
+      }
+    } else {
+      spinVelRef.current = Math.max(0, spinVelRef.current - 6e-4 * (dt / 16));
+    }
     setBalls((prev) => {
-      const next = prev.map((b) => {
-        const angle = Math.atan2(b.y - 0.5, b.x - 0.5) + rotationRef.current * 2e-3 + (Math.random() - 0.5) * 0.08;
-        const radial = 0.012 + Math.random() * 4e-3;
-        let nx = b.x + Math.cos(angle) * radial;
-        let ny = b.y + Math.sin(angle) * radial;
-        nx += (Math.random() - 0.5) * 8e-3;
-        ny += (Math.random() - 0.5) * 6e-3;
-        [nx, ny] = clampInside(nx, ny, 0.485);
-        return { ...b, x: nx, y: ny };
-      });
+      const next = prev.map((b) => ({ ...b }));
+      const S2 = 1;
+      for (let i = 0; i < next.length; i++) {
+        const b = next[i];
+        if (!b.alive) continue;
+        if (b.dropping) {
+          b.dropY += dt * 28e-4;
+          if (b.dropY > 1) {
+            b.alive = false;
+            b.dropping = false;
+          }
+          continue;
+        }
+        const cx2 = b.x - 0.5, cy2 = b.y - 0.5;
+        const ang = Math.atan2(cy2, cx2);
+        const push = spinVelRef.current * 8e-4;
+        b.vx += Math.cos(ang) * push * (dt / 16);
+        b.vy += Math.sin(ang) * push * (dt / 16);
+        b.vx += (Math.random() - 0.5) * 2e-4;
+        b.vy += (Math.random() - 0.5) * 15e-5;
+        b.vx *= 0.995;
+        b.vy *= 0.995;
+        b.x += b.vx * (dt / 16);
+        b.y += b.vy * (dt / 16);
+        const R = 0.485 - b.radius * 0.45;
+        const dx = b.x - 0.5, dy = b.y - 0.5;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist > R) {
+          const nx = dx / dist, ny = dy / dist;
+          const vn = b.vx * nx + b.vy * ny;
+          b.vx -= 1.9 * vn * nx;
+          b.vy -= 1.9 * vn * ny;
+          b.x = 0.5 + nx * R;
+          b.y = 0.5 + ny * R;
+        }
+      }
+      for (let i = 0; i < next.length; i++) {
+        for (let j = i + 1; j < next.length; j++) {
+          const a = next[i], b = next[j];
+          if (!a.alive || !b.alive || a.dropping || b.dropping) continue;
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const dist = Math.sqrt(dx * dx + dy * dy) || 1e-6;
+          const minDist = (a.radius + b.radius) * 0.9;
+          if (dist < minDist) {
+            const overlap = (minDist - dist) / 2;
+            const nx = dx / dist, ny = dy / dist;
+            a.x -= nx * overlap;
+            a.y -= ny * overlap;
+            b.x += nx * overlap;
+            b.y += ny * overlap;
+            const vx = a.vx, vy = a.vy;
+            a.vx = a.vx * 0.7 + b.vx * 0.3;
+            a.vy = a.vy * 0.7 + b.vy * 0.3;
+            b.vx = b.vx * 0.7 + vx * 0.3;
+            b.vy = b.vy * 0.7 + vy * 0.3;
+          }
+        }
+      }
+      for (let b of next) {
+        if (!b.alive || b.dropping) continue;
+        const [clx, cly] = clampInsidePoint(b.x, b.y, 0.485 - b.radius * 0.45);
+        b.x = clx;
+        b.y = cly;
+      }
       return next;
     });
-    if (elapsed < duration) {
-      rafRef.current = requestAnimationFrame(step);
-    } else {
-      setSpinning(false);
-      spinStartRef.current = 0;
-      rotationRef.current = (Math.random() - 0.5) * 2;
-      rafRef.current = null;
+    if (queuedDrop && !spinningRef.current) {
+      setBalls((prev) => {
+        const candidates = prev.filter((b) => b.alive && !b.dropping).map((b) => ({ ...b }));
+        if (candidates.length === 0) return prev;
+        candidates.sort((a, b) => {
+          const da = (a.x - 0.75) ** 2 + (a.y - 0.62) ** 2;
+          const db = (b.x - 0.75) ** 2 + (b.y - 0.62) ** 2;
+          return da - db;
+        });
+        const chosenId = candidates[0].id;
+        return prev.map((b) => b.id === chosenId ? { ...b, dropping: true, dropY: 0, vx: 0, vy: 0 } : b);
+      });
+      setQueuedDrop(null);
     }
+    rafRef.current = requestAnimationFrame(stepPhysics);
   };
   const handleSpin = () => {
-    if (spinning) return;
+    if (spinningRef.current) return;
+    spinningRef.current = true;
     setSpinning(true);
-    spinStartRef.current = 0;
-    rafRef.current = requestAnimationFrame(step);
+    spinStartRef.current = performance.now();
+    lastTsRef.current = performance.now();
+    rafRef.current = requestAnimationFrame(stepPhysics);
+    setTimeout(() => {
+      spinningRef.current = false;
+      setSpinning(false);
+    }, 1400);
   };
   const S = size;
   const r = S * 0.45;
@@ -127,52 +216,52 @@ function BingoCage({ size = 300, ballCount = 14 }) {
       /* @__PURE__ */ jsxDEV("defs", { children: /* @__PURE__ */ jsxDEV("radialGradient", { id: "cageGlow", cx: "50%", cy: "45%", children: [
         /* @__PURE__ */ jsxDEV("stop", { offset: "0%", stopColor: "rgba(255,255,255,0.6)" }, void 0, false, {
           fileName: "<stdin>",
-          lineNumber: 140,
+          lineNumber: 249,
           columnNumber: 15
         }, this),
         /* @__PURE__ */ jsxDEV("stop", { offset: "100%", stopColor: "rgba(255,255,255,0)" }, void 0, false, {
           fileName: "<stdin>",
-          lineNumber: 141,
+          lineNumber: 250,
           columnNumber: 15
         }, this)
       ] }, void 0, true, {
         fileName: "<stdin>",
-        lineNumber: 139,
+        lineNumber: 248,
         columnNumber: 13
       }, this) }, void 0, false, {
         fileName: "<stdin>",
-        lineNumber: 138,
+        lineNumber: 247,
         columnNumber: 11
       }, this),
       /* @__PURE__ */ jsxDEV("ellipse", { cx, cy: cy + r * 0.9, rx: r * 0.65, ry: r * 0.18, fill: "rgba(0,0,0,0.08)" }, void 0, false, {
         fileName: "<stdin>",
-        lineNumber: 146,
+        lineNumber: 255,
         columnNumber: 11
       }, this),
       /* @__PURE__ */ jsxDEV("rect", { x: cx - 6, y: cy + r * 0.85, width: 12, height: S * 0.18, rx: 6, fill: "#444" }, void 0, false, {
         fileName: "<stdin>",
-        lineNumber: 149,
+        lineNumber: 258,
         columnNumber: 11
       }, this),
       /* @__PURE__ */ jsxDEV("rect", { x: cx - S * 0.22, y: cy + r * 0.95, width: S * 0.44, height: S * 0.04, rx: 6, fill: "#333" }, void 0, false, {
         fileName: "<stdin>",
-        lineNumber: 150,
+        lineNumber: 259,
         columnNumber: 11
       }, this),
-      /* @__PURE__ */ jsxDEV("g", { style: { transformOrigin: `${cx}px ${cy}px`, transition: spinning ? "transform 0.08s linear" : "transform 0.6s ease-out", transform: spinning ? `rotate(${rotationRef.current}deg)` : "rotate(0deg)" }, children: [
+      /* @__PURE__ */ jsxDEV("g", { children: [
         /* @__PURE__ */ jsxDEV("circle", { cx, cy, r, fill: "#fafafa", stroke: "none" }, void 0, false, {
           fileName: "<stdin>",
-          lineNumber: 155,
+          lineNumber: 263,
           columnNumber: 13
         }, this),
         /* @__PURE__ */ jsxDEV("circle", { cx, cy, r: r - 2, fill: "url(#cageGlow)", opacity: "0.55" }, void 0, false, {
           fileName: "<stdin>",
-          lineNumber: 156,
+          lineNumber: 264,
           columnNumber: 13
         }, this),
         [-0.6, -0.3, 0, 0.3, 0.6].map((t, i) => /* @__PURE__ */ jsxDEV("ellipse", { cx, cy, rx: r, ry: r * (1 - Math.abs(t) * 0.6), fill: "none", stroke: "#666", strokeWidth: 2, opacity: 0.7 }, i, false, {
           fileName: "<stdin>",
-          lineNumber: 160,
+          lineNumber: 267,
           columnNumber: 15
         }, this)),
         Array.from({ length: 10 }).map((_, i) => {
@@ -181,58 +270,59 @@ function BingoCage({ size = 300, ballCount = 14 }) {
           const y = cy + Math.sin(ang) * r * 0.98;
           return /* @__PURE__ */ jsxDEV("line", { x1: cx, y1: cy - r, x2: x, y2: y, stroke: "#666", strokeWidth: 1.6, opacity: 0.6 }, i, false, {
             fileName: "<stdin>",
-            lineNumber: 168,
+            lineNumber: 274,
             columnNumber: 22
           }, this);
         }),
-        /* @__PURE__ */ jsxDEV("path", { d: `M ${cx + r * 0.55} ${cy + r * 0.15} l ${S * 0.06} ${S * 0.06} l -${S * 0.2} ${S * 0.06} l -${S * 0.02} -${S * 0.08} z`, fill: "#f5f5f5", stroke: "#bdbdbd", strokeWidth: "1" }, void 0, false, {
+        /* @__PURE__ */ jsxDEV("path", { d: `M ${cx + r * 0.54} ${cy + r * 0.18} l ${S * 0.06} ${S * 0.06} l -${S * 0.2} ${S * 0.06} l -${S * 0.02} -${S * 0.08} z`, fill: "#f5f5f5", stroke: "#bdbdbd", strokeWidth: "1" }, void 0, false, {
           fileName: "<stdin>",
-          lineNumber: 172,
+          lineNumber: 278,
           columnNumber: 13
         }, this)
       ] }, void 0, true, {
         fileName: "<stdin>",
-        lineNumber: 153,
+        lineNumber: 262,
         columnNumber: 11
       }, this),
       balls.map((b) => {
+        if (!b.alive) return null;
         const bx = b.x * S;
-        const by = b.y * S;
-        const br = Math.max(10, Math.round(S * 0.06));
+        const by = b.dropping ? cy + r * 0.24 + b.dropY * (S * 0.9) : b.y * S;
+        const br = Math.max(10, Math.round(S * b.radius * 0.9));
         return /* @__PURE__ */ jsxDEV("g", { children: [
           /* @__PURE__ */ jsxDEV("circle", { cx: bx, cy: by, r: br, fill: b.color, stroke: "#aa6b6b", strokeWidth: 2 }, void 0, false, {
             fileName: "<stdin>",
-            lineNumber: 182,
+            lineNumber: 289,
             columnNumber: 17
           }, this),
           /* @__PURE__ */ jsxDEV("text", { x: bx, y: by + br * 0.35, textAnchor: "middle", fontSize: br * 0.8, fontWeight: "700", fill: "#2b2b2b", style: { fontFamily: "Arial, Helvetica, sans-serif", pointerEvents: "none" }, children: (b.id - 1) % 75 + 1 }, void 0, false, {
             fileName: "<stdin>",
-            lineNumber: 183,
+            lineNumber: 290,
             columnNumber: 17
           }, this)
         ] }, b.id, true, {
           fileName: "<stdin>",
-          lineNumber: 181,
+          lineNumber: 288,
           columnNumber: 15
         }, this);
       })
     ] }, void 0, true, {
       fileName: "<stdin>",
-      lineNumber: 137,
+      lineNumber: 246,
       columnNumber: 9
     }, this),
     /* @__PURE__ */ jsxDEV("div", { style: { position: "absolute", right: -S * 0.16, top: cy - 12, width: S * 0.14, height: 24, background: "#555", borderRadius: 6, transform: `rotate(${spinning ? 30 : 0}deg)`, transition: "transform 300ms" } }, void 0, false, {
       fileName: "<stdin>",
-      lineNumber: 192,
+      lineNumber: 299,
       columnNumber: 9
     }, this)
   ] }, void 0, true, {
     fileName: "<stdin>",
-    lineNumber: 136,
+    lineNumber: 245,
     columnNumber: 7
   }, this) }, void 0, false, {
     fileName: "<stdin>",
-    lineNumber: 135,
+    lineNumber: 244,
     columnNumber: 5
   }, this);
 }
@@ -294,16 +384,16 @@ function InteractiveApp() {
     }, children: [
       /* @__PURE__ */ jsxDEV("div", { style: { display: "flex", justifyContent: "center", marginBottom: 6 }, children: /* @__PURE__ */ jsxDEV(BingoCage, { size: 220, ballCount: 14 }, void 0, false, {
         fileName: "<stdin>",
-        lineNumber: 271,
+        lineNumber: 378,
         columnNumber: 15
       }, this) }, void 0, false, {
         fileName: "<stdin>",
-        lineNumber: 270,
+        lineNumber: 377,
         columnNumber: 13
       }, this),
       /* @__PURE__ */ jsxDEV(HeaderSmall, {}, void 0, false, {
         fileName: "<stdin>",
-        lineNumber: 275,
+        lineNumber: 382,
         columnNumber: 13
       }, this),
       /* @__PURE__ */ jsxDEV("div", { style: { display: "grid", gridTemplateColumns: "repeat(5, 92px)", gap: 8, justifyContent: "center", marginTop: 6 }, children: exampleCard.map(
@@ -343,12 +433,12 @@ function InteractiveApp() {
                   zIndex: 0
                 } }, void 0, false, {
                   fileName: "<stdin>",
-                  lineNumber: 305,
+                  lineNumber: 412,
                   columnNumber: 25
                 }, this),
                 /* @__PURE__ */ jsxDEV("div", { style: { zIndex: 1, fontSize: 20 }, children: isFree ? "FREE" : cell }, void 0, false, {
                   fileName: "<stdin>",
-                  lineNumber: 315,
+                  lineNumber: 422,
                   columnNumber: 23
                 }, this)
               ]
@@ -357,7 +447,7 @@ function InteractiveApp() {
             true,
             {
               fileName: "<stdin>",
-              lineNumber: 283,
+              lineNumber: 390,
               columnNumber: 21
             },
             this
@@ -365,20 +455,20 @@ function InteractiveApp() {
         })
       ) }, void 0, false, {
         fileName: "<stdin>",
-        lineNumber: 276,
+        lineNumber: 383,
         columnNumber: 13
       }, this)
     ] }, void 0, true, {
       fileName: "<stdin>",
-      lineNumber: 257,
+      lineNumber: 364,
       columnNumber: 11
     }, this) }, void 0, false, {
       fileName: "<stdin>",
-      lineNumber: 245,
+      lineNumber: 352,
       columnNumber: 9
     }, this) }, void 0, false, {
       fileName: "<stdin>",
-      lineNumber: 243,
+      lineNumber: 350,
       columnNumber: 7
     }, this),
     /* @__PURE__ */ jsxDEV("div", { style: { width: 360, height: 640, display: "flex", alignItems: "center", justifyContent: "center" }, children: /* @__PURE__ */ jsxDEV("div", { style: { width: "100%", height: "100%", boxSizing: "border-box", borderRadius: 12, overflow: "hidden", boxShadow: "0 12px 36px rgba(0,0,0,0.12)" }, children: /* @__PURE__ */ jsxDEV(
@@ -399,17 +489,17 @@ function InteractiveApp() {
       false,
       {
         fileName: "<stdin>",
-        lineNumber: 330,
+        lineNumber: 437,
         columnNumber: 11
       },
       this
     ) }, void 0, false, {
       fileName: "<stdin>",
-      lineNumber: 329,
+      lineNumber: 436,
       columnNumber: 9
     }, this) }, void 0, false, {
       fileName: "<stdin>",
-      lineNumber: 328,
+      lineNumber: 435,
       columnNumber: 7
     }, this),
     /* @__PURE__ */ jsxDEV("div", { style: { width: 360, boxSizing: "border-box", padding: 12, display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 12 }, children: [
@@ -428,7 +518,7 @@ function InteractiveApp() {
           false,
           {
             fileName: "<stdin>",
-            lineNumber: 349,
+            lineNumber: 456,
             columnNumber: 11
           },
           this
@@ -444,45 +534,45 @@ function InteractiveApp() {
           false,
           {
             fileName: "<stdin>",
-            lineNumber: 355,
+            lineNumber: 462,
             columnNumber: 11
           },
           this
         )
       ] }, void 0, true, {
         fileName: "<stdin>",
-        lineNumber: 348,
+        lineNumber: 455,
         columnNumber: 9
       }, this),
       /* @__PURE__ */ jsxDEV("div", { style: { width: "100%", fontSize: 12 }, children: [
         /* @__PURE__ */ jsxDEV("div", { style: { fontWeight: 700, marginBottom: 6 }, children: "Recorded actions JSON" }, void 0, false, {
           fileName: "<stdin>",
-          lineNumber: 364,
+          lineNumber: 471,
           columnNumber: 11
         }, this),
         /* @__PURE__ */ jsxDEV("pre", { style: { whiteSpace: "pre-wrap", wordBreak: "break-word", background: "#f7f7f7", padding: 8, borderRadius: 6, maxHeight: 420, overflow: "auto" }, children: JSON.stringify(actions, null, 2) }, void 0, false, {
           fileName: "<stdin>",
-          lineNumber: 365,
+          lineNumber: 472,
           columnNumber: 11
         }, this)
       ] }, void 0, true, {
         fileName: "<stdin>",
-        lineNumber: 363,
+        lineNumber: 470,
         columnNumber: 9
       }, this)
     ] }, void 0, true, {
       fileName: "<stdin>",
-      lineNumber: 347,
+      lineNumber: 454,
       columnNumber: 7
     }, this)
   ] }, void 0, true, {
     fileName: "<stdin>",
-    lineNumber: 241,
+    lineNumber: 348,
     columnNumber: 5
   }, this);
 }
 createRoot(document.getElementById("app")).render(/* @__PURE__ */ jsxDEV(InteractiveApp, {}, void 0, false, {
   fileName: "<stdin>",
-  lineNumber: 374,
+  lineNumber: 481,
   columnNumber: 51
 }));
